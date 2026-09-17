@@ -1,0 +1,15 @@
+# Environment variables (contains the real API key - never commit this)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# The SQLite database is rebuilt automatically from the CSV on every
+# API startup, so it doesn't need to be committed
+tickets.db
+
+# Common editor/OS junk
+.vscode/
+.idea/
+.DS_Store

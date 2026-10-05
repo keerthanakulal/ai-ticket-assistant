@@ -20,6 +20,20 @@ It also works with any CSV you upload.
 - Exposes everything through a REST API (FastAPI) and a chat-style web
   UI (Streamlit)
 
+## Screenshots
+
+**Ask questions in plain English** (the generated SQL is shown under every answer)
+
+![Chat](screenshots/chat.png)
+
+**Charts are drawn automatically for grouped results**
+
+![Chart](screenshots/chart.png)
+
+**Upload any CSV and ask questions about it**
+
+![Upload](screenshots/upload.png)
+
 ## Setup instructions
 
 **Requirements:** Python 3.11+ (pandas 3 needs it), a free Groq API key.

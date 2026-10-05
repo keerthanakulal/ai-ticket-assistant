@@ -9,8 +9,36 @@ Run the API first (uvicorn app.main:app), then run this with:
 import streamlit as st
 import requests
 import pandas as pd
+import threading
+import time
+import uvicorn
 
 API_URL = "http://127.0.0.1:8000"
+
+@st.cache_resource
+def start_api():
+    """Starts the FastAPI backend in a background thread (once per server).
+    Skipped if an API is already running, e.g. when started by run.py."""
+    try:
+        if requests.get(f"{API_URL}/health", timeout=1).status_code == 200:
+            return True
+    except requests.exceptions.ConnectionError:
+        pass
+
+    from app.main import app
+    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+    threading.Thread(target=uvicorn.Server(config).run, daemon=True).start()
+
+    for _ in range(60):  # wait up to 30 seconds for it to be ready
+        try:
+            if requests.get(f"{API_URL}/health", timeout=1).status_code == 200:
+                return True
+        except requests.exceptions.ConnectionError:
+            time.sleep(0.5)
+    return False
+
+
+start_api()
 
 def show_chart(rows):
     """Draws a bar or line chart when the result is a small table:

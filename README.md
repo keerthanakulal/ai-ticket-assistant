@@ -2,20 +2,26 @@
 
 An AI-powered system for querying and monitoring a customer support ticket
 dataset in natural language, built for the DOTMappers AI Engineer assessment.
+It also works with any CSV you upload.
 
 ## What it does
 
-- Ingests a 500-row support ticket CSV into a queryable SQLite database
-- Answers natural language questions about the tickets (e.g. "Which agent
-  has the lowest average customer rating?")
-- Detects and flags anomalies: abnormally long resolution times, and
-  unresolved High/Critical priority tickets open more than 24 hours
+- Loads a 500-row support ticket CSV into a queryable SQLite database by
+  default, or **any CSV you upload** (the schema is generated automatically
+  from its columns)
+- Answers natural language questions (e.g. "Which agent has the lowest
+  average customer rating?"), including **follow-up questions** such as
+  "Only the open ones"
+- Shows **bar and line charts** automatically for grouped results
+- Detects and flags anomalies for the ticket data: abnormally long
+  resolution times, and unresolved High/Critical priority tickets open more
+  than 24 hours
 - Exposes everything through a REST API (FastAPI) and a chat-style web
   UI (Streamlit)
 
 ## Setup instructions
 
-**Requirements:** Python 3.9+, a free Groq API key.
+**Requirements:** Python 3.11+ (pandas 3 needs it), a free Groq API key.
 
 1. Clone the repo and move into it:
    ```
@@ -23,9 +29,13 @@ dataset in natural language, built for the DOTMappers AI Engineer assessment.
    cd ai-ticket-assistant
    ```
 
-2. Install dependencies:
+2. Create an environment and install dependencies (using
+   [uv](https://docs.astral.sh/uv/)):
    ```
-   pip install -r requirements.txt
+   uv venv --python 3.12
+   .venv\Scripts\activate          (Windows)
+   source .venv/bin/activate       (Mac/Linux)
+   uv pip install -r requirements.txt
    ```
 
 3. Get a free Groq API key at https://console.groq.com (Sign up ->
@@ -54,10 +64,27 @@ dataset in natural language, built for the DOTMappers AI Engineer assessment.
    streamlit run streamlit_app.py
    ```
 
+## Using your own data
+
+In the Streamlit sidebar, use **Upload a CSV file**. The new file replaces
+the current dataset, the schema is rebuilt from its columns, and you can
+start asking questions about it right away. The Anomalies tab is shown only
+for the support-ticket data. Click **Reset to tickets data** to go back to
+the default dataset (it is also reloaded whenever the API restarts).
+
+## Running the tests
+
+```
+python -m pytest -v
+```
+
+13 tests cover the SQL safety check and the anomaly rules. They use a
+temporary database, so your real data is never touched.
+
 ## Architecture overview
 
 ```
-support_tickets.csv
+support_tickets.csv  (or an uploaded CSV)
         |
         v
    SQLite database  <-------------------+
@@ -65,22 +92,31 @@ support_tickets.csv
         v                                |
    FastAPI backend  ------->  Groq LLM (NL question -> SQL)
    (/health, /query,          openai/gpt-oss-120b
-    /anomalies)
+    /anomalies, /upload,
+    /reset, /dataset)
         |
         v
-  Streamlit chat UI  (calls the API, renders answers + full data tables)
+  Streamlit chat UI  (calls the API, renders answers, charts, full data tables)
 ```
 
 **Design decisions and why:**
 
-- **SQLite as the data layer.** The CSV is loaded into SQLite on every API
-  startup (`app/db.py`), rather than querying the CSV/pandas directly.
-  This makes the data genuinely "queryable" via SQL, and scales the same
-  way whether the table has 500 rows or 5 million.
+- **SQLite as the data layer.** The CSV is loaded into SQLite (`app/db.py`),
+  rather than querying the CSV/pandas directly. This makes the data
+  genuinely "queryable" via SQL, and scales the same way whether the table
+  has 500 rows or 5 million. The default tickets CSV is loaded on every API
+  startup; an uploaded CSV replaces it until the next reset or restart.
+
+- **Schema generated from the data.** `get_schema_description()` reads the
+  real columns and types from SQLite, and for short text columns (10 or
+  fewer distinct values) it lists the allowed values so the LLM uses exact
+  spellings (e.g. 'Open', not 'open'). Date-like columns are detected and
+  converted automatically. This is what lets any CSV work without code
+  changes.
 
 - **Two-step LLM pipeline for NL queries**, kept deliberately separate:
   1. `question_to_sql()` - the LLM sees only the table schema (never the
-     raw data) and writes one SQL SELECT statement.
+     raw data rows) and writes one SQL SELECT statement.
   2. The backend executes that SQL itself against SQLite - the real
      answer comes from the database, not the LLM's memory.
   3. `format_answer()` - the LLM sees the actual query result and writes
@@ -92,6 +128,12 @@ support_tickets.csv
   the architecture enforces it structurally rather than just hoping the
   LLM behaves.
 
+- **Conversation memory.** The UI sends the last 3 questions and the SQL
+  they produced along with each new question, so the LLM can resolve
+  follow-ups like "only the open ones". Only the questions and SQL are
+  sent, not the answers or result rows, which keeps it cheap and keeps the
+  "LLM never sees raw data" property.
+
 - **Anomaly detection is NOT done by the LLM.** Both anomaly rules
   (`app/anomalies.py`) are plain Python/pandas: a per-category
   mean + 2*std threshold for long resolution times, and a simple
@@ -100,39 +142,50 @@ support_tickets.csv
   LLM can't reliably reconstruct on demand - so anomaly questions are
   routed (via a keyword check) to these trusted rules instead of the
   NL-to-SQL path, and the LLM's only job there is to summarize the
-  (already correct) result.
+  (already correct) result. The rules run only when the loaded data has the
+  support-ticket columns.
 
 - **A single reference "now" for the whole dataset.** This is a static
   historical dataset (Jan-Mar 2024), so comparing against the real
   wall-clock date would make every relative-time question ("this week",
   "unresolved for 24 hours") behave nonsensically. `db.get_reference_now()`
-  returns the latest `created_at` timestamp in the data, and every module
-  (anomaly rules, LLM prompts) treats that as "now" instead of the real
-  current date.
+  returns the latest timestamp in the first date column of the data, and
+  every module (anomaly rules, LLM prompts) treats that as "now" instead of
+  the real current date. A dataset with no date column simply has no
+  reference "now".
 
-- **A safety guardrail on generated SQL.** Before any LLM-written SQL is
-  executed, it's checked to (a) start with SELECT and (b) contain no
-  INSERT/UPDATE/DELETE/DROP/ALTER keywords. The LLM can only ever read
-  data, never modify it, even if a prompt somehow produced unexpected SQL.
+- **Layered safety for generated SQL.** LLM-written SQL goes through three
+  layers:
+  1. A text check that allows only a single `SELECT` / `WITH` statement and
+     blocks write, schema and `PRAGMA` keywords. Keywords are matched as
+     whole words outside quoted text, so a filter like `LIKE '%update%'`
+     is not wrongly blocked.
+  2. Execution on a **read-only SQLite connection** (`mode=ro`), so the
+     database itself refuses any write even if the text check were bypassed.
+  3. One automatic retry: if the SQL fails, the error is sent back to the
+     LLM once to fix the query.
 
 - **Full result tables are rendered from the database, not the LLM.** The
   API returns the complete matching row set alongside the LLM's short
-  summary sentence. The UI displays that data directly. Early versions
-  had the LLM try to list every matching row itself, which was both
-  wasteful (extra tokens) and unreliable (it would sometimes miscount
-  rows when summarizing a partial sample) - this was found and fixed
-  during testing (see Known limitations).
+  summary sentence. The UI displays that data directly, and draws a bar
+  chart (text labels) or line chart (date labels) when the result is a
+  small label + numbers table. Early versions had the LLM try to list every
+  matching row itself, which was both wasteful (extra tokens) and
+  unreliable (it would sometimes miscount rows when summarizing a partial
+  sample) - this was found and fixed during testing (see Known limitations).
 
 ## Model and tools used
 
 | Component | Tool |
 |---|---|
-| Language | Python 3.9+ |
+| Language | Python 3.11+ |
+| Environment | uv |
 | Database | SQLite (via `sqlite3` + `pandas`) |
 | LLM | Groq free tier, model `openai/gpt-oss-120b` |
 | REST API | FastAPI + Uvicorn |
-| UI | Streamlit (chat interface) |
+| UI | Streamlit (chat interface, charts, CSV upload) |
 | LLM client | `groq` Python SDK |
+| Tests | pytest |
 
 `openai/gpt-oss-120b` was chosen after checking which models were
 actually available on a free-tier Groq account (some models, like
@@ -167,20 +220,30 @@ not the real calendar month.)*
 > [Summarizes the tickets flagged by the long-resolution-time rule whose
 > creation date falls in the last 7 days of the dataset's timeline.]
 
+**Follow-up questions:** ask "How many tickets are there by category?"
+(a bar chart is drawn), then "Only the open ones" - the second question is
+understood in the context of the first.
+
 ## Known limitations
 
-- **Hardcoded to this ticket schema.** The table schema description
-  (given to the LLM) and the two anomaly rules are written specifically
-  for this dataset's columns. Pointing the system at a CSV with a
-  different structure (e.g. sales data) would require updating
-  `get_schema_description()` and `anomalies.py` by hand. A more general
-  version would auto-derive the schema description from the CSV's actual
-  columns/dtypes at load time, and make anomaly rules configurable rather
-  than hardcoded.
+- **Anomaly rules are specific to the ticket data.** Schema generation and
+  question answering work with any uploaded CSV, but the two anomaly rules
+  are written for the support-ticket columns, so the Anomalies tab is
+  hidden for other datasets. A more general version would offer
+  configurable rules, for example flagging numeric outliers in any column.
+
+- **One dataset at a time.** Uploading a CSV replaces the current data
+  rather than adding a second table, and the default tickets data is
+  reloaded when the API restarts.
+
+- **Anomaly routing is keyword-based.** A question containing words like
+  "anomaly" or "unusual" is sent to the anomaly rules, which can only
+  filter by time ("today", "this week", "this month"), not by category,
+  agent or priority.
 
 - **"Relative time" is dataset-relative, not wall-clock.** Since this is
   a static historical snapshot, "today"/"this week"/"this month" are
-  interpreted relative to the latest timestamp in the CSV, not the real
+  interpreted relative to the latest timestamp in the data, not the real
   current date. This is the correct behavior for a snapshot dataset, but
   would need to switch to `datetime.now()` for a live, continuously
   updated ticket system.
@@ -192,10 +255,8 @@ not the real calendar month.)*
   total count as its own field in the prompt, separate from the sampled
   row data, and instructing the LLM not to count rows itself.
 
-- **No conversation memory in the LLM calls themselves.** The Streamlit
-  UI keeps a visual chat history, but each question is sent to the LLM
-  independently - there's no "and what about last week?" follow-up
-  support without repeating context.
+- **Short conversation memory.** Only the last 3 questions (with their SQL)
+  are remembered, and anomaly answers are not part of that memory.
 
 - **Free-tier rate limits.** Groq's free tier has request-per-minute
   limits; heavy concurrent use could hit them. Not an issue for this
@@ -203,7 +264,8 @@ not the real calendar month.)*
 
 ## What I'd improve with more time
 
-- Auto-generate the schema description from the CSV instead of hand-writing it, so the system generalizes to other datasets
-- Add automated tests (currently verified manually against the raw CSV during development)
-- Add simple conversation memory so follow-up questions can reference the previous answer
 - Containerize with Docker for a true one-command, environment-independent setup
+- Let anomaly questions use filters (category, agent, priority) and add a generic numeric-outlier rule for uploaded data
+- Support several uploaded tables at once and let the user pick which one to query
+- Add an accuracy evaluation: a set of benchmark questions with known answers, to measure how often the generated SQL is correct
+- Add a CI workflow that runs the tests on every push

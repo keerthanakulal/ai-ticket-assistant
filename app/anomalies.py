@@ -6,7 +6,7 @@ than asking an LLM to "notice" outliers.
 """
 from datetime import timedelta
 import pandas as pd
-from app.db import get_connection, get_reference_now
+from app.db import get_connection, get_reference_now, is_ticket_dataset
 
 
 def find_long_resolution_anomalies():
@@ -19,7 +19,7 @@ def find_long_resolution_anomalies():
     """
     conn = get_connection()
     df = pd.read_sql(
-        "SELECT * FROM tickets WHERE status = 'Resolved' AND resolution_time_hrs IS NOT NULL",
+        "SELECT * FROM data WHERE status = 'Resolved' AND resolution_time_hrs IS NOT NULL",
         conn,
     )
     conn.close()
@@ -60,7 +60,7 @@ def find_unresolved_high_priority():
     """
     conn = get_connection()
     df = pd.read_sql(
-        "SELECT * FROM tickets WHERE status != 'Resolved' AND priority IN ('High', 'Critical')",
+        "SELECT * FROM data WHERE status != 'Resolved' AND priority IN ('High', 'Critical')",
         conn,
     )
     conn.close()
@@ -85,9 +85,10 @@ def find_unresolved_high_priority():
 
 
 def get_all_anomalies():
-    """Combines both anomaly checks into one list."""
+    """Combines both anomaly checks. Returns [] for non-ticket datasets."""
+    if not is_ticket_dataset():
+        return []
     return find_long_resolution_anomalies() + find_unresolved_high_priority()
-
 
 if __name__ == "__main__":
     results = get_all_anomalies()

@@ -6,3 +6,7 @@ groq==1.7.0
 python-dotenv==1.2.2
 requests==2.33.1
 streamlit>=1.40.0
+python-multipart==0.0.32
+# for running tests
+pytest==9.1.1
+

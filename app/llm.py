@@ -11,23 +11,25 @@ Two paths, chosen by a simple keyword check (is_anomaly_question):
    ("this week", "today"), we filter the list IN CODE (exact date math)
    before handing it to the LLM - the LLM only writes the sentence, it
    never has to do date arithmetic itself, which it's unreliable at.
+   (Only used for the support-ticket dataset.)
 
 2. Everything else -> the standard NL-to-SQL pipeline:
    a. question_to_sql()  - LLM sees only the schema + question, writes SQL
    b. format_answer()    - LLM sees only the question + query RESULT, writes a sentence
 
-The LLM never sees the raw ticket rows in step (a) - only the schema.
+The LLM never sees the raw rows in step (a) - only the schema.
 This keeps the design safe (LLM can't hallucinate raw data into its
 reasoning) and scalable (works the same whether the table has 500 rows
 or 5 million).
 """
 import os
 import re
+import sqlite3
 from datetime import timedelta
 import pandas as pd
 from groq import Groq
 from dotenv import load_dotenv
-from app.db import get_schema_description, run_sql, get_reference_now
+from app.db import get_schema_description, run_readonly_sql, get_reference_now, is_ticket_dataset
 from app.anomalies import get_all_anomalies
 
 load_dotenv()
@@ -50,30 +52,59 @@ def _extract_sql(text: str) -> str:
     return (match.group(1) if match else text).strip().rstrip(";")
 
 
+FORBIDDEN_WORDS = {"insert", "update", "delete", "drop", "alter", "attach",
+                   "detach", "pragma", "create", "replace", "vacuum"}
+
+
 def _is_safe_select(sql: str) -> bool:
     """
-    Guardrail: only allow a single read-only SELECT.
-    Blocks the LLM from ever generating something destructive
-    (INSERT/UPDATE/DELETE/DROP/ALTER), even by mistake.
+    Guardrail: only allow a single read-only SELECT (or WITH ... SELECT).
+    Forbidden words are matched as WHOLE WORDS, outside of quoted text,
+    so a value like 'password update' in a filter is not blocked.
     """
-    normalized = sql.strip().lower()
-    if not normalized.startswith("select"):
+    # Remove quoted text first ('...' and "...") so words inside values are ignored
+    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "", sql)
+    normalized = stripped.strip().lower()
+
+    if not normalized.startswith(("select", "with")):
         return False
-    forbidden = ["insert", "update", "delete", "drop", "alter", "attach", "--", ";"]
-    return not any(word in normalized for word in forbidden)
+    if ";" in normalized or "--" in normalized or "/*" in normalized:
+        return False
+    words = set(re.findall(r"[a-z_]+", normalized))
+    return not (words & FORBIDDEN_WORDS)
 
 
-def question_to_sql(question: str) -> str:
+def question_to_sql(question: str, previous_sql: str = "", error: str = "", history=None) -> str:
     """Turn a natural language question into a SQL query."""
     schema = get_schema_description()
     reference_now = get_reference_now()
+    time_note = (
+        f'IMPORTANT: This is a static historical dataset. Treat {reference_now} '
+        f'as the current date/time ("now") for relative phrases like "today", '
+        f'"this week", "this month". Do NOT use the real current date.'
+        if reference_now else ""
+    )
+    retry_note = (
+        f"\nYour previous query failed.\nPrevious SQL: {previous_sql}\n"
+        f"SQLite error: {error}\nFix the query and return only the corrected SQL.\n"
+        if error else ""
+    )
+    history_note = ""
+    if history:
+        lines = [
+            f"- Q: {t['question']}\n  SQL: {t['sql']}"
+            for t in history[-3:] if t.get("sql")
+        ]
+        if lines:
+            history_note = (
+                "Earlier in this conversation (use it ONLY if the new question is a "
+                "follow-up that refers back to it, otherwise ignore it):\n"
+                + "\n".join(lines) + "\n"
+            )
     prompt = f"""You are a SQLite expert. Given this table schema:
 {schema}
 
-IMPORTANT: This is a static historical dataset, not a live system.
-Treat {reference_now} as the current date/time ("now") for any relative
-time phrases in the question (e.g. "today", "this week", "this month",
-"last N hours"). Do NOT use the real current date.
+{time_note}
 Use SQLite date functions (julianday, datetime, strftime) as needed.
 
 Write exactly ONE SQLite SELECT query that answers the question below.
@@ -83,9 +114,11 @@ Rules:
 - Use the exact column and table names from the schema.
 - Include any column values needed to fully answer the question (not just IDs).
 
+{history_note}
+{retry_note}
 Question: {question}
 SQL:"""
-
+    
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -179,19 +212,25 @@ def answer_anomaly_question(question: str) -> dict:
     return {"question": question, "sql": None, "rows": filtered, "answer": answer}
 
 
-def answer_question(question: str) -> dict:
+def answer_question(question: str, history=None) -> dict:
     """Routes the question, then runs the appropriate pipeline."""
-    if is_anomaly_question(question):
+    # Anomaly rules only exist for the support-ticket dataset
+    if is_anomaly_question(question) and is_ticket_dataset():
         return answer_anomaly_question(question)
 
-    sql = question_to_sql(question)
-    rows = run_sql(sql)
+    sql = question_to_sql(question, history=history)
+    try:
+        rows = run_readonly_sql(sql)
+    except sqlite3.Error as e:
+        # One retry: tell the LLM what went wrong and let it fix the query
+        sql = question_to_sql(question, previous_sql=sql, error=str(e), history=history)
+        rows = run_readonly_sql(sql)
     answer = format_answer(question, rows)
     return {"question": question, "sql": sql, "rows": rows, "answer": answer}
 
 
 if __name__ == "__main__":
-    print("Ask a question about the tickets (type 'exit' to quit)")
+    print("Ask a question about your data (type 'exit' to quit)")
     while True:
         question = input("\nYour question: ").strip()
         if question.lower() in ("exit", "quit"):

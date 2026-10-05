@@ -12,6 +12,10 @@ from pydantic import BaseModel
 from app.db import build_database
 from app.llm import answer_question
 from app.anomalies import get_all_anomalies
+import io
+import pandas as pd
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from app.db import build_database, load_dataframe, is_ticket_dataset
 
 app = FastAPI(title="AI Ticket Assistant", version="1.0")
 
@@ -23,7 +27,7 @@ def startup():
 
 class QueryRequest(BaseModel):
     question: str
-
+    history: list = []
 
 @app.get("/health")
 def health():
@@ -35,7 +39,7 @@ def query(request: QueryRequest):
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="'question' must not be empty")
     try:
-        result = answer_question(request.question)
+        result = answer_question(request.question, request.history)
     except ValueError as e:
         # Raised when the LLM's SQL fails our safety check or comes back empty
         raise HTTPException(status_code=502, detail=str(e))
@@ -57,3 +61,28 @@ def anomalies():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
     return {"count": len(results), "anomalies": results}
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file")
+    try:
+        df = pd.read_csv(io.BytesIO(await file.read()))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
+    if df.empty or len(df.columns) == 0:
+        raise HTTPException(status_code=400, detail="The CSV is empty")
+    rows = load_dataframe(df)
+    return {"rows": rows, "columns": list(df.columns),
+            "is_ticket_dataset": is_ticket_dataset()}
+
+
+@app.post("/reset")
+def reset():
+    rows = build_database()
+    return {"rows": rows, "is_ticket_dataset": True}
+
+
+@app.get("/dataset")
+def dataset():
+    return {"is_ticket_dataset": is_ticket_dataset()}

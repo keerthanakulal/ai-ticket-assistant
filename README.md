@@ -4,6 +4,7 @@ An AI-powered system for querying and monitoring a customer support ticket
 dataset in natural language, built for the DOTMappers AI Engineer assessment.
 It also works with any CSV you upload.
 
+**Live demo:**https://ai-ticket-assistant-url.streamlit.app/
 ## What it does
 
 - Loads a 500-row support ticket CSV into a queryable SQLite database by
